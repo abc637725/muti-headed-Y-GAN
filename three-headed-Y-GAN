@@ -1,0 +1,761 @@
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+#from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import cv2
+import sys
+import glob
+import imageio
+import torchvision
+import math
+import os
+import h5py
+import matplotlib.pyplot as plt
+import torch.autograd as autograd
+import argparse
+from PIL import Image
+from pathlib import Path
+from scipy.ndimage.filters import gaussian_filter
+import scipy.misc
+from torchvision import transforms
+
+######################################################################
+if torch.cuda.is_available():
+    #torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    print("using cuda:", torch.cuda.get_device_name(0))
+    pass
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+device
+######################################################################
+class CelebA():
+    def __init__(self):
+        #datapath = 'celeba-hq-1024x1024.h5'
+        #resolution = ['data2x2', 'data4x4', 'data8x8', 'data16x16', 'data32x32', 'data64x64', 'data128x128', 'data256x256', 'data512x512', 'data1024x1024']
+        resolution = ['data2x2', 'data4x4', 'data8x8', 'data16x16', 'data32x32', 'data64x64', 'data128x128', 'data256x256']
+        self._base_key = 'data'
+
+        self.dataset1 = h5py.File('D:/h5/img/4-g/l.h5py', 'r')
+        self.dataset2 = h5py.File('D:/h5/img/4-g/p.h5py', 'r')
+        
+        self._len = {k:len(self.dataset1[k]) for k in resolution}
+
+        assert all([resol in self.dataset1.keys() for resol in resolution])
+
+    def __call__(self, batch_size, size_p):
+        key = self._base_key + '{}x{}'.format(size_p, size_p)
+        key_64 = self._base_key + '{}x{}'.format(64, 64)
+        idx1 = np.random.randint(self._len[key], size=batch_size)
+        idx2 = np.random.randint(self._len[key], size=batch_size)
+        idx3 = np.random.randint(self._len[key], size=batch_size)
+        #print(idx1) #[494 147  45 423  69 243 147 272 319  47 191  21 207 468 450  27 180 335 437 293 183 139 485 245 278 401 158 168 121 205  12 236]
+        batch_1 = np.array([self.dataset1[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        batch_2 = np.array([self.dataset1[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        batch_3 = np.array([self.dataset2[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        batch_4 = np.array([self.dataset1[key][i]/127.5-1.0 for i in idx2], dtype=np.float32)
+        batch_5 = np.array([self.dataset2[key][i]/127.5-1.0 for i in idx2], dtype=np.float32)
+        #print('batch_x:', batch_x.shape)  batch_x: (32, 3, 4, 4)                
+        return batch_1,batch_2,batch_3,batch_4,batch_5
+uu=256
+data_test = CelebA()
+test_x1,test_x2,test_x3,test_x4,test_x5= data_test(1, uu) 
+print(test_x1.shape)
+img =  ((torch.FloatTensor(test_x3[0]).permute(1,2,0).view(uu,uu,3).cpu().numpy()*0.5+0.5) * 255).astype(np.uint8)
+plt.imshow(img, interpolation='nearest')
+img =  ((torch.FloatTensor(test_x1[0]).permute(1,2,0).view(uu,uu,1).cpu().numpy()*0.5+0.5) * 255).astype(np.uint8)
+plt.imshow(img, interpolation='nearest')
+######################################################################
+from torch.nn import init
+
+def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
+    if gpu_ids:
+        assert(torch.cuda.is_available())
+        net.to(gpu_ids[0])
+        net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
+    init_weights(net, init_type, init_gain=init_gain)
+    return net
+
+def init_weights(net, init_type='normal', init_gain=0.02):
+    def init_func(m):  # define the initialization function
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            if init_type == 'normal':
+                init.normal_(m.weight.data, 0.0, init_gain)
+            elif init_type == 'xavier':
+                init.xavier_normal_(m.weight.data, gain=init_gain)
+            elif init_type == 'kaiming':
+                init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                init.orthogonal_(m.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                init.constant_(m.bias.data, 0.0)
+        elif classname.find('BatchNorm2d') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+            init.normal_(m.weight.data, 1.0, init_gain)
+            init.constant_(m.bias.data, 0.0)
+    print('initialize network with %s' % init_type)
+    net.apply(init_func)  # apply the initialization function <init_func>
+    
+class VGGPerceptualLoss(torch.nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        blocks = []
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[:5].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[5:10].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[10:19].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[19:27].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[28:36].eval())
+        for bl in blocks:
+            for p in bl:
+                p.requires_grad = False
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.transform = torch.nn.functional.interpolate
+        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+        self.resize = resize
+
+    def forward(self, input, target):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input-self.mean) / self.std
+        target = (target-self.mean) / self.std
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+            
+        perception_loss = 0.0
+        style_loss = 0.0
+        
+        x = input
+        y = target
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            perception_loss += torch.nn.functional.l1_loss(x, y)
+            style_loss += torch.nn.functional.l1_loss(self.gram_matrix(x), self.gram_matrix(y))
+        return perception_loss, style_loss
+
+    # https://hoya012.github.io/blog/Fast-Style-Transfer-Tutorial/
+    def gram_matrix(self, y):
+        (b, ch, h, w) = y.size()
+        features = y.view(b, ch, w * h)
+        features_t = features.transpose(1, 2)
+        gram = features.bmm(features_t) / (ch * h * w)
+        return gram
+
+######################################################################
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResBlock, self).__init__()
+        
+        def block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            
+            layers += [nn.ReLU(inplace=True)]
+            layers += [nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+        
+        self.block_1 = block(in_channels,out_channels)
+        self.block_2 = block(out_channels,out_channels)
+        self.block_3 = block(out_channels,out_channels)
+        self.block_4 = block(out_channels,out_channels)
+        self.block_5 = block(out_channels,out_channels)
+        self.block_6 = block(out_channels,out_channels)
+        self.block_7 = block(out_channels,out_channels)
+        self.block_8 = block(out_channels,out_channels)
+        self.block_9 = block(out_channels,out_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        
+        # block 1
+        residual = x
+        out = self.block_1(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 2
+        residual = out
+        out = self.block_2(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 3
+        residual = out
+        out = self.block_3(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 4
+        residual = out
+        out = self.block_4(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 1
+        residual = x
+        out = self.block_5(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 2
+        residual = out
+        out = self.block_6(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 3
+        residual = out
+        out = self.block_7(x)
+        out += residual
+        out = self.relu(out)
+        
+        # block 4
+        residual = out
+        out = self.block_8(x)
+        out += residual
+        out = self.relu(out)
+        
+        residual = out
+        out = self.block_9(x)
+        out += residual
+        out = self.relu(out)
+        
+        return out
+    
+class Encoder(nn.Module):
+    
+    def __init__(self, in_channels):
+        super(Encoder, self).__init__()
+        
+        def CL2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True, LR_negative_slope=0.2):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                kernel_size=kernel_size, stride=stride, padding=padding,
+                                bias=bias)]
+            layers += [nn.LeakyReLU(LR_negative_slope)]
+            cbr = nn.Sequential(*layers)
+            return cbr
+        
+        # conv_layer
+        self.conv1 = CL2d(in_channels,32)
+        self.conv2 = CL2d(32,32)
+        self.conv3 = CL2d(32,32,stride=2)
+        self.conv4 = CL2d(32,32)
+        self.conv5 = CL2d(32,64,stride=2)
+        self.conv6 = CL2d(64,64)
+        self.conv7 = CL2d(64,128,stride=2)
+        self.conv8 = CL2d(128,128)
+        self.conv9 = CL2d(128,256,stride=2)
+        self.conv10 = CL2d(256,256)
+        
+        # downsample_layer
+        self.downsample1 = nn.AvgPool2d(kernel_size=16, stride=16)
+        self.downsample2 = nn.AvgPool2d(kernel_size=8, stride=8)
+        self.downsample3 = nn.AvgPool2d(kernel_size=4, stride=4)
+        self.downsample4 = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+    def forward(self, x):
+
+        f1 = self.conv1(x)
+        f2 = self.conv2(f1)
+        f3 = self.conv3(f2)
+        f4 = self.conv4(f3)
+        f5 = self.conv5(f4)
+        f6 = self.conv6(f5)
+        f7 = self.conv7(f6)
+        f8 = self.conv8(f7)       
+        f9 = self.conv9(f8)
+        f10 = self.conv10(f9)
+        
+        F = [f9, f8, f7, f6, f5, f4, f3, f2 ,f1]
+        
+        v1 = self.downsample1(f1)
+        v2 = self.downsample1(f2)
+        v3 = self.downsample2(f3)
+        v4 = self.downsample2(f4)
+        v5 = self.downsample3(f5)
+        v6 = self.downsample3(f6)
+        v7 = self.downsample4(f7)
+        v8 = self.downsample4(f8)
+        
+        V0 = torch.cat((v1,v2,v3,v4), dim=1)
+        V1 = torch.cat((v5,v6,v7,v8,f9,f10), dim=1)
+        V=[self.transpo(V0),self.transpo(V1)]                
+        return V,F
+    
+    def transpo(self,V):
+        V = torch.reshape(V,(V.size(0),V.size(1),V.size(2)*V.size(3))) 
+        #V = torch.transpose(V,1,2)  # torch.Size([1, 256=16*16, 992=通道])
+        return V    
+
+class UNetDecoder(nn.Module):
+    def __init__(self):
+        super(UNetDecoder, self).__init__()
+        #self.scft_D = SCFT_D(sketch_channels=1, reference_channels=3)
+        
+        self.scft = SCFT_s()
+
+        def CBR2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            layers += [nn.ReLU()]
+
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        self.dec5_1 = CBR2d(in_channels=128*2, out_channels=512)
+        self.unpool4 = nn.ConvTranspose2d(in_channels=512, out_channels=512,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec4_2 = CBR2d(in_channels=512+128, out_channels=256)
+        self.dec4_1 = CBR2d(in_channels=256+128, out_channels=128)
+        self.unpool3 = nn.ConvTranspose2d(in_channels=128, out_channels=128,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec3_2 = CBR2d(in_channels=128+64, out_channels=64)
+        self.dec3_1 = CBR2d(in_channels=64+64, out_channels=64)
+        self.unpool2 = nn.ConvTranspose2d(in_channels=64, out_channels=64,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec2_2 = CBR2d(in_channels=64+32, out_channels=32)
+        self.dec2_1 = CBR2d(in_channels=32+32, out_channels=32)
+        self.unpool1 = nn.ConvTranspose2d(in_channels=32, out_channels=32,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec1_2 = CBR2d(in_channels=32+32, out_channels=32)
+        self.dec1_1 = CBR2d(in_channels=32+32, out_channels=32)
+        self.dec1_01 = CBR2d(in_channels=32, out_channels=32)
+        self.dec1_02 = CBR2d(in_channels=32, out_channels=32)
+        self.dec1_03 = CBR2d(in_channels=32, out_channels=32)
+
+        self.fc = nn.Conv2d(in_channels=32, out_channels=3, kernel_size=3, stride=1, padding=1, bias=True)
+        self.fc1 = nn.Tanh()
+
+    def forward(self, x, Fs1, Fs2, Fr):
+        
+        Fs4_2=self.scft(Fs1[1],Fs2[1],Fr[1],Fs1[1].size(3))
+        Fs4_1=self.scft(Fs1[2],Fs2[2],Fr[2],Fs1[2].size(3))
+        Fs3_2=self.scft(Fs1[3],Fs2[3],Fr[3],Fs1[3].size(3))
+        Fs3_1=self.scft(Fs1[4],Fs2[4],Fr[4],Fs1[4].size(3))
+        Fs2_2=self.scft(Fs1[5],Fs2[5],Fr[5],Fs1[5].size(3))
+        Fs2_1=self.scft(Fs1[6],Fs2[6],Fr[6],Fs1[6].size(3))
+        Fs1_2=self.scft(Fs1[7],Fs2[7],Fr[7],Fs1[7].size(3))
+        Fs1_1=self.scft(Fs1[8],Fs2[8],Fr[8],Fs1[8].size(3))
+        
+        dec5_1 = self.dec5_1(x)  #256
+    
+        unpool4 = self.unpool4(dec5_1)
+        dec4_2 = self.dec4_2(torch.cat((unpool4,Fs4_2),dim=1))   #512+128  , 128
+
+        dec4_1 = self.dec4_1(torch.cat((dec4_2,Fs4_1),dim=1))
+        unpool3 = self.unpool3(dec4_1)
+        
+        dec3_2 = self.dec3_2(torch.cat((unpool3,Fs3_2),dim=1))
+        dec3_1 = self.dec3_1(torch.cat((dec3_2,Fs3_1),dim=1))
+        unpool2 = self.unpool2(dec3_1)
+        
+        dec2_2 = self.dec2_2(torch.cat((unpool2,Fs2_2),dim=1))
+        dec2_1 = self.dec2_1(torch.cat((dec2_2,Fs2_1),dim=1))
+        unpool1 = self.unpool1(dec2_1)
+
+        dec1_2 = self.dec1_2(torch.cat((unpool1,Fs1_2),dim=1))
+        dec1_1 = self.dec1_1(torch.cat((dec1_2,Fs1_1),dim=1))
+        dec1_01 = self.dec1_01(dec1_1)
+        dec1_02 = self.dec1_02(dec1_01)
+        dec1_03 = self.dec1_03(dec1_02)
+
+        x = self.fc(dec1_03)
+        x = self.fc1(x)
+        return x
+    
+class SCFT(nn.Module):
+    
+    def __init__(self, sketch_channels, reference_channels):
+        super(SCFT, self).__init__()
+        
+    def forward(self, Vs1, Vs2, Vr, s):
+        
+        quary =torch.transpose(Vs1[0],1,2)
+        key = torch.transpose(Vr[0],1,2)
+        value = torch.transpose(Vr[0],1,2)
+        c1=self.scaled_dot_product(quary,key,value)
+        c1 = torch.add(c1, quary)
+        
+        quary =torch.transpose(Vs2[0],1,2)
+        key = torch.transpose(Vr[0],1,2)
+        value = torch.transpose(Vr[0],1,2)
+        c3=self.scaled_dot_product(quary,key,value)
+        c3 = torch.add(c3, quary)
+       
+        c=torch.add(c1,c3)
+        c = torch.transpose(c,1,2)
+        c = torch.reshape(c,(c.size(0),c.size(1),s,s))        
+        return c
+    
+    def scaled_dot_product(self, query, key, value, mask=None, dropout=None):
+        "Compute 'Scaled Dot Product Attention'"
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) \
+                / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        p_attn = F.softmax(scores, dim = -1)
+
+        if dropout is not None:
+            p_attn = dropout(p_attn)
+        return torch.matmul(p_attn, value)
+    
+class SCFT_s(nn.Module):
+    
+    def __init__(self):
+        super(SCFT_s, self).__init__()
+        
+        
+    def forward(self, Fs1, Fs2, Fr, s):
+        
+        Fs1 = torch.reshape(Fs1,(Fs1.size(0),Fs1.size(1),Fs1.size(2)*Fs1.size(3))) 
+        Fs2 = torch.reshape(Fs2,(Fs2.size(0),Fs2.size(1),Fs2.size(2)*Fs2.size(3)))
+        
+        c1=self.scaled_dot_product(Fs1,Fs2,Fs2)
+        c2=self.scaled_dot_product(c1,Fs1,Fs1)
+        c3=self.scaled_dot_product(c2,Fs2,Fs2)
+        c4=self.scaled_dot_product(c3,Fs1,Fs1)
+
+        c5=self.scaled_dot_product(Fs2,Fs1,Fs1)
+        c6=self.scaled_dot_product(c5,Fs2,Fs2)
+        c7=self.scaled_dot_product(c6,Fs1,Fs1)
+        c8=self.scaled_dot_product(c7,Fs2,Fs2)
+
+        c=torch.add(c4,c8)*0.5
+
+        c = torch.reshape(c,(c.size(0),c.size(1),s,s))        
+        return c
+    
+    def scaled_dot_product(self, query, key, value, mask=None, dropout=None):
+        "Compute 'Scaled Dot Product Attention'"
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) \
+                / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        p_attn = F.softmax(scores, dim = -1)
+
+        if dropout is not None:
+            p_attn = dropout(p_attn)
+        return torch.matmul(p_attn, value)
+        
+class Generator(nn.Module):
+    
+    def __init__(self, sketch_channels=1, reference_channels=3, LR_negative_slope=0.2):
+        super(Generator, self).__init__()
+        
+        self.encoder_sketch1 = Encoder(sketch_channels)
+        self.encoder_sketch2 = Encoder(sketch_channels)
+        self.encoder_reference1 = Encoder(reference_channels)
+        self.scft = SCFT(sketch_channels, reference_channels)
+        self.resblock = ResBlock(128, 128)
+        self.unet_decoder = UNetDecoder()
+    
+    def forward(self, sketch_img1, sketch_img2, reference_img):
+        
+        # encoder 
+        Vs1, Fs1 = self.encoder_sketch1(sketch_img1)
+        Vs2, Fs2 = self.encoder_sketch2(sketch_img2)
+        Vr, Fr = self.encoder_reference1(reference_img)
+
+        # scft
+        c = self.scft(Vs1,Vs2,Vr,16)
+        
+        # resblock
+        c_out = self.resblock(c)
+        
+        # unet decoder
+        I_gt = self.unet_decoder(torch.cat((c,c_out),dim=1), Fs1, Fs2, Fr)
+
+        return I_gt
+        #torch.Size([1, 3, 256, 256]) torch.Size([1, 256, 992]) torch.Size([1, 256, 992]) torch.Size([1, 256, 992])
+        
+class Discriminator(nn.Module):
+    def __init__(self, ndf, nChannels):
+        super(Discriminator, self).__init__()
+        # input : (batch * nChannels * image width * image height)
+        # Discriminator will be consisted with a series of convolution networks
+
+        self.layer1 = nn.Sequential(
+            # Input size : input image with dimension (nChannels)*64*64
+            # Output size: output feature vector with (ndf)*32*32
+            nn.Conv2d(in_channels = nChannels,out_channels = ndf,kernel_size = 4,stride = 2,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer1_1 = nn.Sequential(
+            # Input size : input image with dimension (nChannels)*64*64
+            # Output size: output feature vector with (ndf)*32*32
+            nn.Conv2d(in_channels = ndf,out_channels = ndf,kernel_size = 3,stride = 1,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.layer2 = nn.Sequential(
+            # Input size : input feature vector with (ndf)*32*32
+            # Output size: output feature vector with (ndf*2)*16*16
+            nn.Conv2d(in_channels = ndf,out_channels = ndf*2,kernel_size = 4,stride = 2,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer2_1 = nn.Sequential(
+            # Input size : input image with dimension (nChannels)*64*64
+            # Output size: output feature vector with (ndf)*32*32
+            nn.Conv2d(in_channels = ndf*2,out_channels = ndf*2,kernel_size = 3,stride = 1,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.layer3 = nn.Sequential(
+            # Input size : input feature vector with (ndf*2)*16*16
+            # Output size: output feature vector with (ndf*4)*8*8
+            nn.Conv2d(in_channels = ndf*2,out_channels = ndf*4,kernel_size = 4,stride = 2,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer3_1 = nn.Sequential(
+            # Input size : input image with dimension (nChannels)*64*64
+            # Output size: output feature vector with (ndf)*32*32
+            nn.Conv2d(in_channels = ndf*4,out_channels = ndf*4,kernel_size = 3,stride = 1,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer4 = nn.Sequential(
+            # Input size : input feature vector with (ndf*4)*8*8
+            # Output size: output feature vector with (ndf*8)*4*4
+            nn.Conv2d(in_channels = ndf*4,out_channels = ndf*8,kernel_size = 4,stride = 2,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.layer4_1 = nn.Sequential(
+            # Input size : input image with dimension (nChannels)*64*64
+            # Output size: output feature vector with (ndf)*32*32
+            nn.Conv2d(in_channels = ndf*8,out_channels = ndf*8,kernel_size = 3,stride = 1,padding = 1,bias = False),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+                   
+        self.layer5 = nn.Sequential(
+            # Input size : input feature vector with (ndf*8)*4*4
+            # Output size: output probability of fake/real image
+            nn.Conv2d(in_channels = ndf*8,out_channels = 1,kernel_size = 4,stride = 1,padding = 0, bias = False),
+            # nn.Sigmoid() -- Replaced with Least Square Loss
+        )
+
+
+    def forward(self, x):
+        out = self.layer1(x)
+        out = self.layer1_1(out)
+        out = self.layer2(out)
+        out = self.layer2_1(out)
+        out = self.layer3(out) 
+        out = self.layer3_1(out) 
+        out = self.layer4(out) 
+        out = self.layer4_1(out)  #torch.Size([1, 1, 13, 13])
+        out = self.layer5(out) 
+        return out
+######################################################################
+class Train:
+    
+    def __init__(self, G, D, data, args):
+
+        self.lr_g = args.lr_g
+        self.lr_d = args.lr_d
+        self.beta1 = args.beta1
+        self.beta2 = args.beta2
+        self.batch_size = args.batch_size
+        self.num_epoch = args.num_epoch
+        self.save = args.save
+        
+        self.generator = G.cuda()
+        self.discriminator = D.cuda()
+        self.scft_t = SCFT_s().cuda()
+        self.data = data
+        #self.train_continue = args.train_continue
+        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # model parameter 초기화
+        init_net(self.generator, init_type='normal', init_gain=0.02, gpu_ids=[])
+        init_net(self.discriminator, init_type='normal', init_gain=0.02, gpu_ids=[])
+
+    def _numpy2var(self, x):
+        var = Variable(torch.from_numpy(x))
+        var = var.cuda()
+        return var        
+        
+    def train(self):
+
+        # optimizer
+        self.optimG = torch.optim.Adam(self.generator.parameters(), lr=self.lr_g, betas=(self.beta1, self.beta2))
+        self.optimD = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_d, betas=(self.beta1, self.beta2))
+       
+        # loss 함수 선언
+        self.adversarial_loss = torch.nn.MSELoss()
+        self.l1_loss = torch.nn.L1Loss()
+        self.vgg_loss = VGGPerceptualLoss().cuda() #style loss + perceptual_loss
+        
+        
+
+        for epoch in range(1,self.num_epoch+1):
+            if epoch > 100:
+                self.optimG, self.optimD = self.schedule_optim(self.optimG, self.optimD, epoch)
+                
+            for index in range(10000):
+                
+                    #print(cur_resol, cur_level)   #cur_resol=4， 步进时cur_resol=8，
+                for mo in range(1,5):                    
+                    sketch_img1,sketch_img2,reference_img,sketch_img_r,reference_img_r = self.data(self.batch_size, 256)
+                        
+                    if mo ==2:
+                        sketch_img1=sketch_img_r
+                        reference_img=reference_img_r
+
+                    if mo ==3:
+                        sketch_img2=sketch_img_r
+                        reference_img=reference_img_r                    
+                                            
+                    if mo ==4:
+                        reference_img=reference_img_r
+                        
+                    self.x1=self._numpy2var(sketch_img1)
+                    self.x2=self._numpy2var(sketch_img2)
+                    self.x3=self._numpy2var(reference_img)
+                    #self.ref=torch.mean(self.x3, dim=1)
+                    #self.ref=torch.reshape(self.ref,(1,1,256,256))
+                    #self.x4=self.scft_t(self.x1,self.x2,self.ref,256)
+
+                    # ---------------------
+                    #  Train Generator
+                    # ---------------------
+                    self.fake_I_gt = self.generator(self.x1, self.x2, self.x3) #G
+                    self.fake_output = self.discriminator(self.fake_I_gt)   #D
+
+                    self.g_adversarial_loss = self.adversarial_loss(self.fake_output, torch.ones_like(self.fake_output)) #对抗损失
+                    self.g_l1_loss = self.l1_loss(self.fake_I_gt, self.x3)   #L1损失
+                    self.g_perceptual_loss, self.g_style_loss = self.vgg_loss(self.fake_I_gt,self.x3)   #内容、风格损失
+
+                    
+                    if mo ==1:
+                        self.g_loss = self.g_adversarial_loss + self.g_l1_loss*20.0 + self.g_perceptual_loss*0.01 + self.g_style_loss
+                        
+                    if mo ==2:
+                        self.g_loss = self.g_adversarial_loss + self.g_l1_loss*20.0  + self.g_perceptual_loss*0.01 + self.g_style_loss
+                        
+                    if mo ==3:
+                        self.g_loss = self.g_adversarial_loss + self.g_l1_loss*20.0  + self.g_perceptual_loss*0.01 + self.g_style_loss
+                    
+                    if mo ==4:
+                        self.g_loss = self.g_adversarial_loss  + self.g_perceptual_loss*0.01 + self.g_style_loss
+
+                    self.optimG.zero_grad()
+                    self.g_loss.backward()
+                    self.optimG.step()
+
+                    # ---------------------
+                    #  Train Discriminator
+                    # ---------------------
+                    if mo !=99:
+                        self.fake_output = self.discriminator(self.fake_I_gt.detach())
+                        self.real_output = self.discriminator(self.x3)
+                        self.d_real_loss = self.adversarial_loss(self.real_output, torch.ones_like(self.real_output))
+                        self.d_fake_loss = self.adversarial_loss(self.fake_output, torch.zeros_like(self.fake_output))
+                        self.d_loss = self.d_real_loss + self.d_fake_loss
+
+                        self.optimD.zero_grad()
+                        self.d_loss.backward()
+                        self.optimD.step()
+
+                                    
+                if index % 1000==0:
+                    samples = self.fake_I_gt[0].detach().cpu().data.numpy()*0.5+0.5
+                    samples = samples.transpose([1, 2, 0])
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave(self.save + str(epoch) + '-'+ str(index) + '-1.jpg', samples, quality=95)
+                    
+                    samples = self.x1[0].detach().cpu().data.numpy()*0.5+0.5
+                    samples = samples.transpose([1, 2, 0])
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave(self.save + str(epoch) + '-'+ str(index) + '-2.jpg', samples, quality=95)
+                    
+                    samples = self.x2[0].detach().cpu().data.numpy()*0.5+0.5
+                    samples = samples.transpose([1, 2, 0])
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave(self.save + str(epoch) + '-'+ str(index) + '-3.jpg', samples, quality=95)
+                    
+                    samples = self.x3[0].detach().cpu().data.numpy()*0.5+0.5
+                    samples = samples.transpose([1, 2, 0])
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave(self.save + str(epoch) + '-'+ str(index) + '-4.jpg', samples, quality=95)
+                    
+                    formation = 'Iter[%d], G: %.3f, G_adv: %.3f, G_l1: %.3f, G_per: %.3f, G_sty: %.3f, D: %.3f, D_real: %.3f, D_fake: %.3f'
+                    values = (index, self.g_loss, self.g_adversarial_loss,self.g_l1_loss,self.g_perceptual_loss,self.g_style_loss,
+                             self.d_loss, self.d_real_loss, self.d_fake_loss)
+                    print(formation % values)
+
+            if epoch % 1==0: 
+                torch.save(self.generator.state_dict(), self.save + str(epoch) + '-save-' + str(index)+ '-G.pth')
+                torch.save(self.discriminator.state_dict(), self.save + str(epoch) + '-save-' + str(index)+ '-D.pth')
+       
+    def schedule_optim(self, optimG, optimD, epoch):
+        optimG.param_groups[0]['lr'] = self.lr_g - (self.lr_g / (self.num_epoch - 100))*(epoch-100)
+        optimD.param_groups[0]['lr'] = self.lr_d - (self.lr_d / (self.num_epoch - 100))*(epoch-100)
+  
+        return optimG, optimD
+    
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lr_g', default=2e-4, type=float, dest='lr_g')
+    parser.add_argument('--lr_d', default=2e-4, type=float, dest='lr_d')
+    parser.add_argument('--beta1', default=0.5, type=float, dest='beta1')
+    parser.add_argument('--beta2', default=0.999, type=float, dest='beta2')
+    parser.add_argument('--batch_size', default=1, type=int, dest='batch_size')
+    parser.add_argument('--num_epoch', default=100, type=int, dest='num_epoch')
+    parser.add_argument('--save', default= 'D:/h5/results9/1023-building/', type=str, help='')
+    parser.add_argument('--train_continue', default='off', type=str, dest='train_continue')
+
+
+######################################################################
+# TODO: support conditional inputs
+args = parser.parse_known_args()[0]
+opts = {k:v for k,v in args._get_kwargs()}
+G = Generator(sketch_channels=1, reference_channels=3, LR_negative_slope=0.2)
+D = Discriminator(ndf=32, nChannels=3)
+print(G)
+print(D)
+data = CelebA()
+TR = Train(G,D,data,args)
+%time TR.train()
