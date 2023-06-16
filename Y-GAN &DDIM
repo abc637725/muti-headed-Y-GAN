@@ -1,0 +1,1308 @@
+import math
+import copy
+import torch
+import numpy as np
+import imageio
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+import sys
+import glob
+
+import torchvision
+import os
+# import h5py
+
+import torch.autograd as autograd
+import argparse
+
+
+from torch import nn, einsum
+from functools import partial
+from torch.utils import data
+from torch.cuda.amp import autocast, GradScaler
+from pathlib import Path
+from torch.optim import Adam
+from torchvision import transforms, utils
+from PIL import Image
+from tqdm import tqdm
+from einops import rearrange
+from torch.autograd import Variable
+from torch.nn import init
+from inspect import isfunction
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class CelebA():
+    def __init__(self):
+        #datapath = 'celeba-hq-1024x1024.h5'
+        #resolution = ['data2x2', 'data4x4', 'data8x8', 'data16x16', 'data32x32', 'data64x64', 'data128x128', 'data256x256', 'data512x512', 'data1024x1024']
+        resolution = ['data2x2', 'data4x4', 'data8x8', 'data16x16', 'data32x32', 'data64x64', 'data128x128', 'data256x256']
+        self._base_key = 'data'
+        #self.dataset1 = h5py.File('D:/h5/img/0-PCGAN/4385_line.h5py', 'r')
+        #self.dataset2 = h5py.File('D:/h5/img/0-PCGAN/4385_pic.h5py', 'r')
+        #self.dataset2 = h5py.File('D:/h5/img/0-PCGAN/256_line_600.h5py', 'r')
+        #self.dataset1 = h5py.File('D:/h5/img/0-PCGAN/256_pic_600.h5py', 'r')
+        #self.dataset3 = h5py.File('D:/h5/img/0-PCGAN/256_pic_600.h5py', 'r')
+        self.dataset1 = h5py.File('D:/h5/img/4-g/p_test_10000.h5py', 'r')
+        self.dataset2 = h5py.File('D:/h5/img/4-g/l_test_10000.h5py', 'r')
+        self.dataset3 = h5py.File('D:/h5/img/4-g/r_test_10000.h5py', 'r')
+        #self.dataset2 = h5py.File('D:/h5/img/4-g/l_test_face_256.h5py', 'r')
+        #self.dataset1 = h5py.File('D:/h5/img/4-g/p_test_face_256.h5py', 'r')
+        #self.dataset3 = h5py.File('D:/h5/img/4-g/r_test_face_256.h5py', 'r')
+        #self.dataset1 = h5py.File('D:/h5/img/4-g/p_test_10000_new.h5py', 'r')
+        #self.dataset2 = h5py.File('D:/h5/img/4-g/l_test_10000_new.h5py', 'r')
+        #self.dataset3 = h5py.File('D:/h5/img/4-g/r_test_10000_new.h5py', 'r')
+        #self.dataset1 = h5py.File('D:/h5/img/4-g/p_test_building_256_4385.h5py', 'r')
+        #self.dataset2 = h5py.File('D:/h5/img/4-g/l_test_building_256_4385.h5py', 'r')
+        #self.dataset3 = h5py.File('D:/h5/img/4-g/r_test_building_256_4385.h5py', 'r')
+        self._len = {k:len(self.dataset1[k]) for k in resolution}
+
+        assert all([resol in self.dataset1.keys() for resol in resolution])
+
+    def __call__(self, batch_size, size_p):
+        key = self._base_key + '{}x{}'.format(size_p, size_p)
+        idx1 = np.random.randint(self._len[key], size=batch_size)
+        idx2 = np.random.randint(self._len[key], size=batch_size)
+
+        #print(idx1) #[494 147  45 423  69 243 147 272 319  47 191  21 207 468 450  27 180 335 437 293 183 139 485 245 278 401 158 168 121 205  12 236]
+        batch_1 = np.array([self.dataset1[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        batch_2 = np.array([self.dataset2[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        batch_3 = np.array([self.dataset3[key][i]/127.5-1.0 for i in idx1], dtype=np.float32)
+        #print('batch_x:', batch_x.shape)  batch_x: (32, 3, 4, 4)
+                
+        return batch_1,batch_2,batch_3
+###############################################################################################
+'''
+def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
+    if gpu_ids:
+        assert (torch.cuda.is_available())
+        net.to(gpu_ids[0])
+        net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
+    init_weights(net, init_type, init_gain=init_gain)
+    return net
+
+
+def init_weights(net, init_type='normal', init_gain=0.02):
+    def init_func(m):  # define the initialization function
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            if init_type == 'normal':
+                init.normal_(m.weight.data, 0.0, init_gain)
+            elif init_type == 'xavier':
+                init.xavier_normal_(m.weight.data, gain=init_gain)
+            elif init_type == 'kaiming':
+                init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                init.orthogonal_(m.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                init.constant_(m.bias.data, 0.0)
+        elif classname.find(
+                'BatchNorm2d') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+            init.normal_(m.weight.data, 1.0, init_gain)
+            init.constant_(m.bias.data, 0.0)
+
+    print('initialize network with %s' % init_type)
+    net.apply(init_func)  # apply the initialization function <init_func>
+
+
+class VGGPerceptualLoss(torch.nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        blocks = []
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[:5].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[5:10].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[10:19].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[19:27].eval())
+        blocks.append(torchvision.models.vgg19(pretrained=True).features[28:36].eval())
+        for bl in blocks:
+            for p in bl:
+                p.requires_grad = False
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.transform = torch.nn.functional.interpolate
+        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.resize = resize
+
+    def forward(self, input, target):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input - self.mean) / self.std
+        target = (target - self.mean) / self.std
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+
+        perception_loss = 0.0
+        style_loss = 0.0
+
+        x = input
+        y = target
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            perception_loss += torch.nn.functional.l1_loss(x, y)
+            style_loss += torch.nn.functional.l1_loss(self.gram_matrix(x), self.gram_matrix(y))
+        return perception_loss, style_loss
+
+    # https://hoya012.github.io/blog/Fast-Style-Transfer-Tutorial/
+    def gram_matrix(self, y):
+        (b, ch, h, w) = y.size()
+        features = y.view(b, ch, w * h)
+        features_t = features.transpose(1, 2)
+        gram = features.bmm(features_t) / (ch * h * w)
+        return gram
+
+
+############################################以上没有变化
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResBlock, self).__init__()
+
+        def block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+
+            layers += [nn.ReLU(inplace=True)]
+            layers += [nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        self.block_1 = block(in_channels, out_channels)
+        self.block_2 = block(out_channels, out_channels)
+        self.block_3 = block(out_channels, out_channels)
+        self.block_4 = block(out_channels, out_channels)
+        self.block_5 = block(out_channels, out_channels)
+        self.block_6 = block(out_channels, out_channels)
+        self.block_7 = block(out_channels, out_channels)
+        self.block_8 = block(out_channels, out_channels)
+        self.block_9 = block(out_channels, out_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # block 1
+        residual = x
+        out = self.block_1(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 2
+        residual = out
+        out = self.block_2(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 3
+        residual = out
+        out = self.block_3(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 4
+        residual = out
+        out = self.block_4(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 1
+        residual = x
+        out = self.block_5(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 2
+        residual = out
+        out = self.block_6(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 3
+        residual = out
+        out = self.block_7(x)
+        out += residual
+        out = self.relu(out)
+
+        # block 4
+        residual = out
+        out = self.block_8(x)
+        out += residual
+        out = self.relu(out)
+
+        residual = out
+        out = self.block_9(x)
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Encoder(nn.Module):
+
+    def __init__(self, in_channels):
+        super(Encoder, self).__init__()
+
+        def CL2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True, LR_negative_slope=0.2):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.LeakyReLU(LR_negative_slope)]
+            cbr = nn.Sequential(*layers)
+            return cbr
+
+        # conv_layer
+        self.conv1 = CL2d(in_channels, 16)
+        self.conv2 = CL2d(16, 16)
+        self.conv3 = CL2d(16, 32, stride=2)
+        self.conv4 = CL2d(32, 32)
+        self.conv5 = CL2d(32, 64, stride=2)
+        self.conv6 = CL2d(64, 64)
+        self.conv7 = CL2d(64, 128, stride=2)
+        self.conv8 = CL2d(128, 128)
+        self.conv9 = CL2d(128, 256, stride=2)
+        self.conv10 = CL2d(256, 256)
+
+        # downsample_layer
+        self.downsample1 = nn.AvgPool2d(kernel_size=16, stride=16)
+        self.downsample2 = nn.AvgPool2d(kernel_size=8, stride=8)
+        self.downsample3 = nn.AvgPool2d(kernel_size=4, stride=4)
+        self.downsample4 = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        f1 = self.conv1(x)
+        f2 = self.conv2(f1)
+        f3 = self.conv3(f2)
+        f4 = self.conv4(f3)
+        f5 = self.conv5(f4)
+        f6 = self.conv6(f5)
+        f7 = self.conv7(f6)
+        f8 = self.conv8(f7)
+
+        f9 = self.conv9(f8)
+        f10 = self.conv10(f9)
+
+        F = [f9, f8, f7, f6, f5, f4, f3, f2, f1]
+
+        v1 = self.downsample1(f1)
+        v2 = self.downsample1(f2)
+        v3 = self.downsample2(f3)
+        v4 = self.downsample2(f4)
+        v5 = self.downsample3(f5)
+        v6 = self.downsample3(f6)
+        v7 = self.downsample4(f7)
+        v8 = self.downsample4(f8)
+        # print(v1.shape,v2.shape,v3.shape,v4.shape,v5.shape,v6.shape,v7.shape,v8.shape,f9.shape,f10.shape)
+
+        V10 = torch.cat((v1, v2, v3, v4, v5, v6, v7, v8, f9, f10), dim=1)
+        V8 = torch.cat((self.downsample2(f1), self.downsample2(f2), self.downsample3(f3), self.downsample3(f4),
+                        self.downsample4(f5), self.downsample4(f6), f7, f8), dim=1)
+        V6 = torch.cat((self.downsample3(f1), self.downsample3(f2), self.downsample4(f3), self.downsample4(f4), f5, f6),
+                       dim=1)
+        V4 = torch.cat((self.downsample4(f1), self.downsample4(f2), f3, f4), dim=1)
+        V2 = torch.cat((f1, f2), dim=1)
+
+        V = [self.transpo(V10), self.transpo(V8), self.transpo(V6), self.transpo(V4), self.transpo(V2)]
+        # V = torch.reshape(V,(V.size(0),V.size(1),V.size(2)*V.size(3)))
+        # V = torch.transpose(V,1,2)  # torch.Size([1, 256=16*16, 992=通道])
+
+        return V, F
+
+    def transpo(self, V):
+        V = torch.reshape(V, (V.size(0), V.size(1), V.size(2) * V.size(3)))
+        V = torch.transpose(V, 1, 2)  # torch.Size([1, 256=16*16, 992=通道])
+        return V
+
+
+class UNetDecoder(nn.Module):
+    def __init__(self):
+        super(UNetDecoder, self).__init__()
+        # self.scft_D = SCFT_D(sketch_channels=1, reference_channels=3)
+
+        self.scft = SCFT(sketch_channels=1, reference_channels=3)
+
+        def CBR2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                 kernel_size=kernel_size, stride=stride, padding=padding,
+                                 bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            layers += [nn.ReLU()]
+
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        self.dec5_1 = CBR2d(in_channels=992 + 992, out_channels=512)
+        self.unpool4 = nn.ConvTranspose2d(in_channels=512, out_channels=512,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec4_2 = CBR2d(in_channels=512 + 480, out_channels=256)
+        self.dec4_1 = CBR2d(in_channels=256 + 128, out_channels=128)
+        self.unpool3 = nn.ConvTranspose2d(in_channels=128, out_channels=128,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec3_2 = CBR2d(in_channels=128 + 64, out_channels=64)
+        self.dec3_1 = CBR2d(in_channels=64 + 64, out_channels=64)
+        self.unpool2 = nn.ConvTranspose2d(in_channels=64, out_channels=64,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec2_2 = CBR2d(in_channels=64 + 32, out_channels=32)
+        self.dec2_1 = CBR2d(in_channels=32 + 32, out_channels=32)
+        self.unpool1 = nn.ConvTranspose2d(in_channels=32, out_channels=32,
+                                          kernel_size=2, stride=2, padding=0, bias=True)
+
+        self.dec1_2 = CBR2d(in_channels=32 + 16, out_channels=32)
+        self.dec1_1 = CBR2d(in_channels=32 + 16, out_channels=32)
+
+        self.fc = nn.Conv2d(in_channels=32, out_channels=3, kernel_size=3, stride=1, padding=1, bias=True)
+        self.fc1 = nn.Tanh()
+
+    def forward(self, x, Vs, Vr, Fs, Fr):
+        dec5_1 = self.dec5_1(x)  # 256
+
+        i1, quary, key, value = self.scft(Vs[1], Vr[1], 32)
+
+        unpool4 = self.unpool4(dec5_1)
+        dec4_2 = self.dec4_2(torch.cat((unpool4, i1), dim=1))  # 512+128  , 128
+
+        dec4_1 = self.dec4_1(torch.cat((dec4_2, Fs[2]), dim=1))
+        unpool3 = self.unpool3(dec4_1)
+
+        dec3_2 = self.dec3_2(torch.cat((unpool3, Fs[3]), dim=1))
+        dec3_1 = self.dec3_1(torch.cat((dec3_2, Fs[4]), dim=1))
+        unpool2 = self.unpool2(dec3_1)
+
+        dec2_2 = self.dec2_2(torch.cat((unpool2, Fs[5]), dim=1))
+        dec2_1 = self.dec2_1(torch.cat((dec2_2, Fs[6]), dim=1))
+        unpool1 = self.unpool1(dec2_1)
+
+        dec1_2 = self.dec1_2(torch.cat((unpool1, Fs[7]), dim=1))
+        dec1_1 = self.dec1_1(torch.cat((dec1_2, Fs[8]), dim=1))
+
+        x = self.fc(dec1_1)
+        x = self.fc1(x)
+        return x
+
+
+class SCFT(nn.Module):
+
+    def __init__(self, sketch_channels, reference_channels, dv=992):
+        super(SCFT, self).__init__()
+
+        # self.dv = torch.tensor(dv).float()
+
+        # self.w_q = nn.Linear(dv,dv)
+        # self.w_k = nn.Linear(dv,dv)
+        # self.w_v = nn.Linear(dv,dv)
+
+    def forward(self, Vs, Vr, s):
+
+        # quary = self.w_q(Vs)
+        # key = self.w_k(Vr)
+        # value = self.w_v(Vr)
+
+        quary = Vs
+        key = Vr
+        value = Vr
+        c = torch.add(self.scaled_dot_product(quary, key, value), Vs)
+        c = torch.transpose(c, 1, 2)
+        c = torch.reshape(c, (c.size(0), c.size(1), s, s))
+
+        return c, quary, key, value
+
+    def scaled_dot_product(self, query, key, value, mask=None, dropout=None):
+        "Compute 'Scaled Dot Product Attention'"
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) \
+                 / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        p_attn = F.softmax(scores, dim=-1)
+
+        if dropout is not None:
+            p_attn = dropout(p_attn)
+        return torch.matmul(p_attn, value)
+
+
+class Generator(nn.Module):
+
+    def __init__(self, sketch_channels=1, reference_channels=3, LR_negative_slope=0.2):
+        super(Generator, self).__init__()
+
+        self.encoder_sketch = Encoder(sketch_channels)
+        self.encoder_reference = Encoder(reference_channels)
+        self.scft = SCFT(sketch_channels, reference_channels)
+        self.resblock = ResBlock(992, 992)
+        self.unet_decoder = UNetDecoder()
+
+    def forward(self, sketch_img, reference_img):
+        # encoder
+        Vs, Fs = self.encoder_sketch(sketch_img)
+        Vr, Fr = self.encoder_reference(reference_img)
+        # scft
+        c, quary, key, value = self.scft(Vs[0], Vr[0], 16)
+        key = c
+        # resblock
+        c_out = self.resblock(c)
+
+        # unet decoder
+        # I_gt = self.unet_decoder(torch.cat((c,c_out),dim=1), Fs,Fr)
+        I_gt = self.unet_decoder(torch.cat((c, c_out), dim=1), Vs, Vr, Fs, Fr)
+
+        return I_gt
+
+
+SCFT_GAN_building_Y = Generator(sketch_channels=1, reference_channels=3, LR_negative_slope=0.2).to(device)
+
+SCFT_GAN_building_Y.load_state_dict(torch.load('D:/h5/styleGAN/0401/s-building-G.pth', map_location='cpu'))
+
+'''
+
+
+
+###################################################################
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+def num_to_groups(num, divisor):
+    groups = num // divisor
+    remainder = num % divisor
+    arr = [divisor] * groups
+    if remainder > 0:
+        arr.append(remainder)
+    return arr
+
+def normalize_to_neg_one_to_one(img):
+    return img * 2 - 1
+
+def unnormalize_to_zero_to_one(t):
+    return (t + 1) * 0.5
+
+# small helper modules
+
+class EMA():   ####指数移动平均
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def update_model_average(self, ma_model, current_model):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old_weight, up_weight)
+
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
+
+class SinusoidalPosEmb(nn.Module):   #sinusoidal position embedding正弦位置嵌入
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+def Upsample(dim):
+    return nn.ConvTranspose2d(dim, dim, 4, 2, 1)
+
+def Downsample(dim):
+    return nn.Conv2d(dim, dim, 4, 2, 1)
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x):
+        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
+        mean = torch.mean(x, dim = 1, keepdim = True)
+        return (x - mean) / (var + self.eps).sqrt() * self.g + self.b
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
+
+# building block modules
+
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, groups = 8):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(dim, dim_out, 3, padding = 1),
+            nn.GroupNorm(groups, dim_out),
+            nn.LeakyReLU()
+        )
+    def forward(self, x):
+        return self.block(x)
+
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LeakyReLU(),
+            nn.Linear(time_emb_dim, dim_out)
+        ) if exists(time_emb_dim) else None
+
+        self.block1 = Block(dim, dim_out, groups = groups)
+        self.block2 = Block(dim_out, dim_out, groups = groups)
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x, time_emb = None):
+        h = self.block1(x)
+
+        if exists(self.mlp) and exists(time_emb):
+            time_emb = self.mlp(time_emb)
+            h = rearrange(time_emb, 'b c -> b c 1 1') + h
+
+        h = self.block2(h)
+        return h + self.res_conv(x)
+    
+class ConvNextBlock(nn.Module):
+    """A ConvNet for the 2020s"""
+ 
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, mult=2, norm=True):
+        super().__init__()
+        self.mlp = (
+            nn.Sequential(nn.GELU(), nn.Linear(time_emb_dim, dim))
+            if exists(time_emb_dim)
+            else None
+        )
+ 
+        self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
+ 
+        self.net = nn.Sequential(
+            nn.GroupNorm(1, dim) if norm else nn.Identity(),
+            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(1, dim_out * mult),
+            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
+        )
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+ 
+    def forward(self, x, time_emb=None):
+        h = self.ds_conv(x)
+ 
+        if exists(self.mlp) and exists(time_emb):
+            condition = self.mlp(time_emb)
+            h = h + rearrange(condition, "b c -> b c 1 1")
+ 
+        h =  self.net(h)
+        return h + self.res_conv(x)
+    
+class LinearAttention(nn.Module):
+    def __init__(self, dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Conv2d(hidden_dim, dim, 1),
+            LayerNorm(dim)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim = 1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+
+        q = q.softmax(dim = -2)
+        k = k.softmax(dim = -1)
+
+        q = q * self.scale
+        context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
+
+        out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
+        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
+        return self.to_out(out)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim = 1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+        q = q * self.scale
+
+        sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
+        attn = sim.softmax(dim = -1)
+
+        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
+        return self.to_out(out)
+
+# model
+
+class Unet(nn.Module):
+    def __init__(
+        self,
+        dim,
+        init_dim = None,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 3,
+        with_time_emb = True,
+        resnet_block_groups = 8,
+        learned_variance = False
+    ):
+        super().__init__()
+
+        # determine dimensions
+
+        self.channels = channels
+
+        init_dim = default(init_dim, dim // 2 * 2)
+        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding = 3)
+        
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        block_klass = partial(ResnetBlock, groups = resnet_block_groups)
+
+        # time embeddings
+
+        if with_time_emb:
+            time_dim = dim * 8
+            self.time_mlp = nn.Sequential(
+                SinusoidalPosEmb(dim*2),
+                nn.Linear(dim*2, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim)
+            )
+        else:
+            time_dim = None
+            self.time_mlp = None
+
+        # layers
+
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+        num_resolutions = len(in_out)
+
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                block_klass(dim_in, dim_out, time_emb_dim = time_dim),
+                block_klass(dim_out, dim_out, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        mid_dim = dims[-1]
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.ups.append(nn.ModuleList([
+                block_klass(dim_out * 2, dim_in, time_emb_dim = time_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim =default(out_dim, default_out_dim)
+
+        self.final_conv = nn.Sequential(
+            block_klass(dim, dim),
+            nn.Conv2d(dim, self.out_dim, 1)
+        )
+
+    def forward(self, x, time):
+        x = self.init_conv(x)
+        t = self.time_mlp(time) if exists(self.time_mlp) else None
+
+        h = []
+
+        for block1, block2, attn, downsample in self.downs:
+            x = block1(x, t)
+            x = block2(x, t)
+            x = attn(x)
+            h.append(x)
+            x = downsample(x)
+
+        x = self.mid_block1(x, t)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, t)
+
+        for block1, block2, attn, upsample in self.ups:
+            x = torch.cat((x, h.pop()), dim=1) #移除列表中的一个元素(默认最后一个元素)，并且返回该元素的值
+            x = block1(x, t)
+            x = block2(x, t)
+            x = attn(x)
+            x = upsample(x)
+
+        return self.final_conv(x)
+
+# gaussian diffusion trainer class
+
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+def noise_like(shape, device, repeat=False):
+    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
+    noise = lambda: torch.randn(shape, device=device)
+    return repeat_noise() if repeat else noise()
+
+def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
+class GaussianDiffusion(nn.Module):
+    def __init__(
+        self,
+        denoise_fn,
+        *,
+        image_size=256,
+        channels = 3,
+        timesteps = 1000,
+        loss_type = 'l1',
+        objective = 'pred_noise'
+        #objective = 'pred_x0'
+
+    ):
+        super().__init__()
+        assert not (type(self) == GaussianDiffusion and denoise_fn.channels != denoise_fn.out_dim)
+
+        self.channels = channels
+        self.image_size = image_size
+        self.denoise_fn = denoise_fn
+        self.objective = objective
+
+        betas = cosine_beta_schedule(timesteps)
+
+        #self.betas = betas
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, axis=0)    ###累乘
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.loss_type = loss_type
+
+        # helper function to register buffer from float64 to float32
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
+        register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, x, t, clip_denoised: bool):
+        model_output = self.denoise_fn(x, t)
+
+        if self.objective == 'pred_noise':
+            x_start = self.predict_start_from_noise(x, t = t, noise = model_output)
+        elif self.objective == 'pred_x0':
+            x_start = model_output
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
+        return model_mean, posterior_variance, posterior_log_variance,x_start
+    
+    @torch.no_grad()
+    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
+        b, *_, device = *x.shape, x.device
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)########################################
+        noise = noise_like(x.shape, device, repeat_noise)
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape, imgr):
+        device = self.betas.device
+
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+        #img=imgr
+
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+
+        #img = unnormalize_to_zero_to_one(img)
+        return img
+  
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    @property
+    def loss_fn(self):
+        if self.loss_type == 'l1':
+            return F.l1_loss
+        elif self.loss_type == 'l2':
+            return F.mse_loss
+        else:
+            raise ValueError(f'invalid loss type {self.loss_type}')
+
+    def p_losses(self, x_start, t, noise = None):
+        b, c, h, w = x_start.shape
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_out = self.denoise_fn(x, t)
+
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        loss = self.loss_fn(model_out, target)
+        return loss, model_out, target
+
+    def forward(self, img, *args, **kwargs):
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        #img = normalize_to_neg_one_to_one(img)
+        loss, model_out, target=self.p_losses(img, t,  *args, **kwargs)
+        return loss, model_out, target
+    
+#####################################encoding########################## 
+    def reverse_sample(self, model_output, x, t_prev,t,T):
+
+        step=1000//T
+        alpha_bar_t = self.alphas_cumprod_prev[t_prev]
+        alpha_bar_t_next = self.alphas_cumprod[t]
+
+        inter = (((1-alpha_bar_t_next)/alpha_bar_t_next)** (0.5) - ((1-alpha_bar_t)/alpha_bar_t)** (0.5) )
+        x_t_next = alpha_bar_t_next** (0.5) * (x/ (alpha_bar_t ** (0.5)) + (model_output * inter))
+
+        return x_t_next
+
+
+    def sample_to_noise(self, image, T):
+
+        step=1000//T    
+        with torch.no_grad():
+            indices = list(range(0,self.num_timesteps,step))[::1]
+            for i in indices:
+                
+                #print(i//10)
+                
+                
+                t_prev = torch.tensor([i-step+1], device=device)if (i-step+1) >= 0 else torch.tensor([0], device=device)  
+                t=torch.tensor([i], device=device)
+                model_output=self.denoise_fn(image, t)
+                image = self.reverse_sample(model_output=model_output, x=image, t_prev=t_prev,t=t,T=T)
+                z=image
+
+        return z
+
+    @torch.no_grad()
+    def sample_interpolation(self, z1, z2, eta, T, n, function=0):
+
+        def slerp(z1, z2, alpha):
+            theta = torch.acos(torch.sum(z1 * z2) / (torch.norm(z1) * torch.norm(z2)))
+            return (torch.sin((1 - alpha) * theta) / torch.sin(theta) * z1+ torch.sin(alpha * theta) / torch.sin(theta) * z2)
+        def slerp1(z1, z2, alpha):
+            return z1*alpha+(1-alpha)*z2
+
+        alpha = torch.arange(0.0, 0.9, 0.2).to(z1.device)
+        z_ = []
+        if function==0:
+            
+            for i in range(n):
+                z_.append(slerp1(z1, z2, 0.5))
+                x = torch.cat(z_, dim=0)
+            
+        if function==1:
+            for i in range(n):
+                z_.append(slerp(z1, z2, 0.5))#.clamp(-1., 1.)
+
+                x = torch.cat(z_, dim=0)
+        with torch.no_grad():
+
+            xs=self.ddim_sample_loop(x.size(0),x, eta, T)
+        
+        return xs
+    
+######################################decoding#############################
+    def _extract_into_tensor(self, arr, timesteps, broadcast_shape):
+        res = arr[timesteps].float()
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res.expand(broadcast_shape)
+
+    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        sqrt_recip_alphas_cumprod1=torch.sqrt(1. / F.pad(self.alphas_cumprod, (1, 0), value = 1.))
+        sqrt_recipm1_alphas_cumprod1=torch.sqrt(1. / F.pad(self.alphas_cumprod, (1, 0), value = 1.)-1)
+        out=(self._extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t- pred_xstart) / self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        return out
+                                                                                                                          
+    def ddim_sample(self, model,x,t,t_prev,eta=0.0, T=1000, clip_denoised=True,denoised_fn=None,cond_fn=None,model_kwargs=None, ):
+
+        _, _, _, pred_xstart = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised) ########################################                
+
+        eps = self._predict_eps_from_xstart(x, t, pred_xstart)
+        alpha_bar = self._extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev =self._extract_into_tensor(self.alphas_cumprod_prev, t_prev, x.shape) 
+
+        sigma = (eta* torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))* torch.sqrt(1 - alpha_bar / alpha_bar_prev))
+
+        noise = torch.randn_like(x)
+        mean_pred = (pred_xstart * torch.sqrt(alpha_bar_prev)+ torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps)
+        nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(x.shape) - 1))))  # no noise when t == 0
+        sample = mean_pred + nonzero_mask * sigma * noise
+        
+        return {"sample": sample, "pred_xstart": pred_xstart}
+    
+    def ddim_sample_loop_progressive(self,model,shape, imgr,eta=0.0,T=1000, noise=None,clip_denoised=True,denoised_fn=None,cond_fn=None,model_kwargs=None,
+        device=None,progress=False,):
+        step=1000//T
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = torch.randn(*shape, device=device)
+            img = imgr
+        indices = list(range(0,self.num_timesteps,step))[::-1]
+
+
+        if progress:
+            from tqdm.auto import tqdm
+            indices = tqdm(indices)
+        out={}
+        for i in indices:
+            
+            #print(100-i//10)
+            
+            t = torch.tensor([i] * shape[0], device=device)
+            t_prev = torch.tensor([i-step+1] * shape[0], device=device)if (i-step+1) >= 0 else torch.tensor([0] * shape[0], device=device)  
+            with torch.no_grad():
+                out = self.ddim_sample(model,img,t,t_prev,eta=eta,T=T,clip_denoised=clip_denoised,denoised_fn=denoised_fn,cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,)
+                yield out
+                img = out["sample"]
+
+    def ddim_sample_loop(self,batch_size,img,eta,T, noise=None,clip_denoised=True,denoised_fn=None,
+                         cond_fn=None,model_kwargs=None, device=None,progress=False,):
+        model=self.denoise_fn
+        shape=(batch_size,self.channels,self.image_size,self.image_size)
+        final = None
+        n=0
+        for sample in self.ddim_sample_loop_progressive(model, shape,img,eta=eta,T=T, noise=noise,clip_denoised=clip_denoised,denoised_fn=denoised_fn,
+            cond_fn=cond_fn,model_kwargs=model_kwargs,device=device,progress=progress,):
+            final = sample
+            n=n+1
+        return final["sample"]
+
+class Trainer(object):
+    def __init__(
+        self,
+        diffusion_model,
+        *,
+        ema_decay = 0.995,
+        image_size = 256,
+        train_batch_size = 4,
+        train_lr = 1e-4,
+        train_num_steps = 4000000,
+        gradient_accumulate_every = 1,
+        amp = False,
+        step_start_ema = 500,
+        update_ema_every = 5,
+        save_and_sample_every = 2000,
+    ):
+        super().__init__()
+        self.model = diffusion_model
+        self.ema = EMA(ema_decay)
+        self.ema_model = copy.deepcopy(self.model)
+        self.update_ema_every = update_ema_every
+
+        self.step_start_ema = step_start_ema
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.image_size = diffusion_model.image_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.train_num_steps = train_num_steps
+        self.opt = Adam(self.model.parameters(), lr=train_lr)
+        self.step = 0
+        self.amp = amp
+        self.scaler = GradScaler(enabled = amp)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.ema_model.load_state_dict(self.model.state_dict())
+
+    def step_ema(self):
+        if self.step < self.step_start_ema:
+            self.reset_parameters()
+            return
+        self.ema.update_model_average(self.ema_model, self.model)
+
+    def save(self, milestone):
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'ema': self.ema_model.state_dict(),
+            'scaler': self.scaler.state_dict()
+        }
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+
+        self.step = data['step']
+        self.model.load_state_dict(data['model'])
+        self.ema_model.load_state_dict(data['ema'])
+        self.scaler.load_state_dict(data['scaler'])
+    def _numpy2var(self, x):
+        var = Variable(torch.from_numpy(x))
+        var = var.cuda()
+        return var
+    
+    def train(self):
+        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
+
+            while self.step < self.train_num_steps:
+                
+                for i in range(self.gradient_accumulate_every):
+
+                    #data = next(self.dl).cuda()
+                    appearance_img,sketch_img1,sketch_img2 = self.data(self.batch_size, self.image_size)    #print(cur_resol, cur_level)   #cur_resol=4， 步进时cur_resol=8，
+                    self.xx=self._numpy2var(appearance_img).clamp_(-1., 1.)
+
+                    with autocast(enabled = self.amp):
+                        loss, model_out, target = self.model(self.xx)
+                        
+                        self.scaler.scale(loss / self.gradient_accumulate_every).backward()
+
+                    pbar.set_description(f'loss: {loss.item():.4f}')
+
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                self.opt.zero_grad()
+
+                if self.step % self.update_ema_every == 0:
+                    self.step_ema()
+
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    self.ema_model.eval()
+                    
+                    s=self.ema_model.p_sample_loop((2, self.xx.size(1),self.image_size,self.image_size),self.xx)
+
+                    samples = s[0].detach().cpu().data.numpy()
+                    samples = samples.transpose([1, 2, 0])*0.5+0.5
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave('D:/'+str(self.step)+'-0.jpg', samples, quality=95)
+                    samples = s[1].detach().cpu().data.numpy()
+                    samples = samples.transpose([1, 2, 0])*0.5+0.5
+                    samples=(samples * 255).astype(np.uint8)
+                    imageio.imsave('D:/'+str(self.step)+'-1.jpg', samples, quality=95)
+                    
+                    milestone = self.step // self.save_and_sample_every
+
+                if self.step != 0 and self.step % (self.save_and_sample_every*5) == 0:
+                    self.save(milestone)
+
+                self.step += 1
+                pbar.update(1)
+
+        print('training complete')
+######################################
+U=Unet(64)
+G=GaussianDiffusion(U).to(device)
+SCFT_GAN_building = Trainer(G)
+%time TR.train()
+
+######################################
+data = torch.load('D:/model-900.pt', map_location='cpu')
+SCFT_GAN_building.step = data['step']
+SCFT_GAN_building.model.load_state_dict(data['model'])
+SCFT_GAN_building.ema_model.load_state_dict(data['ema'])
+SCFT_GAN_building.scaler.load_state_dict(data['scaler'])
+
+######################################
+def load_image_line(path):
+    img = Image.open(path)
+    if len(img.split()) == 3:
+        img = plt.imread(path)
+        img = np.uint8(img)
+        img = Image.fromarray(img)
+        img = img.convert('L')
+        img = np.array(img)
+    elif len(img.split()) == 1:
+        img = plt.imread(path)
+
+    img = transforms.ToTensor()(img)  # tensor数据格式是torch(C,H,W)
+    img = (img - 0.5) * 2.0
+    img = img[np.newaxis, :]
+    return img
+
+
+def load_image_img(path):
+    img = plt.imread(path)
+    img = transforms.ToTensor()(img)  # tensor数据格式是torch(C,H,W)
+    img = (img - 0.5) * 2.0
+    img = img[np.newaxis, :]
+    return img
+
+
+def Sample(img1_path, img2_path, img3_path, img4_path):
+    timestamp = int(time.time())
+    out_name = str(timestamp)
+
+    out_name = 'building/' + out_name + '_result.jpg'
+
+    sketch_img1 = load_image_line(img1_path).to(device)
+    sketch_img2 = load_image_line(img2_path).to(device)
+    reference_img1 = load_image_img(img3_path).to(device)
+    reference_img2 = load_image_img(img4_path).to(device)
+    
+    '''
+    xx1 = SCFT_GAN_building_Y(sketch_img1, reference_img1)
+    xx2 = SCFT_GAN_building_Y(sketch_img2, reference_img2)
+    '''
+    xx1=reference_img1
+    xx2=reference_img2
+    
+    flexibility=0.1   #[0.0,   0.1,   0.2]
+    degree=0.5        #[0.25,  0.5,  0.75]
+    quality=1000      #[200,  500,  1000]
+    quantity=1        #[1,  2,  4,  8]
+    
+    #interpolating before encoding ######
+    image = SCFT_GAN_building.ema_model.sample_to_noise((xx1*(1-degree) + xx2*degree), quality)
+    output =SCFT_GAN_building.ema_model.sample_interpolation(image,image, flexibility,  quality, quantity)
+    
+    '''
+    #interpolating latten vectors######
+    image1 = SCFT_GAN_building.ema_model.sample_to_noise(xx1, quality)
+    image2 = SCFT_GAN_building.ema_model.sample_to_noise(xx1, quality)
+    output =SCFT_GAN_building.ema_model.sample_interpolation(image1,image2, flexibility,  quality, quantity)
+    '''
+    for i in range(quantity):
+        samples = output[i].detach().cpu().data.numpy() * 0.5 + 0.5
+        samples = samples.transpose([1, 2, 0])
+        samples = (samples * 255).astype(np.uint8)
+        imageio.imsave('D:/q0.jpg', samples, quality=95)
+
+    return 'static/output/three_forecast/' + out_name
+
+Sample('D:/s1.jpg', 'D:/s2.jpg','D:/r1.jpg', 'D:/r2.jpg')
